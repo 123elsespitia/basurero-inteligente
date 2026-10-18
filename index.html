@@ -1,0 +1,213 @@
+
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Basurero Inteligente</title>
+
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@latest/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@teachablemachine/image@latest/dist/teachablemachine-image.min.js"></script>
+
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      text-align: center;
+      background: #eef5ee;
+      color: #203020;
+      padding: 20px;
+    }
+    button {
+      padding: 12px 18px;
+      margin: 6px;
+      border: none;
+      border-radius: 8px;
+      background: #267a43;
+      color: white;
+      font-size: 16px;
+      cursor: pointer;
+    }
+    #estado, #resultado {
+      margin: 18px auto;
+      padding: 12px;
+      background: white;
+      border-radius: 10px;
+      max-width: 500px;
+      overflow-wrap: anywhere;
+    }
+    #camara canvas {
+      max-width: 100%;
+      height: auto;
+    }
+  </style>
+</head>
+
+<body>
+  <h1>♻️ Basurero inteligente</h1>
+  <p>Clasifica un residuo con la cámara y envía la categoría al Arduino.</p>
+
+  <button onclick="cargarModelo()">1. Cargar modelo</button>
+  <button id="camaraBtn" onclick="iniciarCamara()" disabled>2. Activar cámara</button>
+  <button onclick="conectarArduino()">3. Conectar Arduino</button>
+
+  <div id="estado">Estado: esperando.</div>
+  <div id="camara"></div>
+  <div id="resultado">Clasificación: todavía no hay resultados.</div>
+
+  <script>
+    const URL_MODELO = "./modelo/";
+    const UUID_SERVICIO = "19b10000-e8f2-537e-4f6c-d104768a1214";
+    const UUID_CARACTERISTICA = "19b10001-e8f2-537e-4f6c-d104768a1214";
+
+    let modelo = null;
+    let camara = null;
+    let dispositivo = null;
+    let caracteristica = null;
+    let clasificando = false;
+    let ultimaCategoria = "";
+    let inicioCategoria = 0;
+    let ultimoEnvio = 0;
+
+    const estado = document.getElementById("estado");
+    const resultado = document.getElementById("resultado");
+
+    function mostrarEstado(mensaje) {
+      estado.textContent = "Estado: " + mensaje;
+    }
+
+    async function cargarModelo() {
+      try {
+        mostrarEstado("cargando el modelo...");
+
+        modelo = await tmImage.load(
+          URL_MODELO + "model.json",
+          URL_MODELO + "metadata.json"
+        );
+
+        document.getElementById("camaraBtn").disabled = false;
+        mostrarEstado("modelo cargado correctamente.");
+      } catch (error) {
+        mostrarEstado("error al cargar el modelo. Revisa los archivos.");
+        console.error(error);
+      }
+    }
+
+    async function iniciarCamara() {
+      try {
+        if (!modelo) {
+          mostrarEstado("primero debes cargar el modelo.");
+          return;
+        }
+        if (camara) return;
+
+        camara = new tmImage.Webcam(320, 240, true);
+        await camara.setup();
+        await camara.play();
+
+        document.getElementById("camara").replaceChildren(camara.canvas);
+        mostrarEstado("cámara activa. Muestra un residuo.");
+        window.requestAnimationFrame(bucle);
+      } catch (error) {
+        mostrarEstado("no se pudo activar la cámara. Revisa los permisos.");
+        console.error(error);
+        camara = null;
+      }
+    }
+
+    async function conectarArduino() {
+      try {
+        if (!navigator.bluetooth) {
+          mostrarEstado("usa Chrome en Android y abre la página mediante HTTPS.");
+          return;
+        }
+
+        mostrarEstado("buscando el Arduino...");
+
+        dispositivo = await navigator.bluetooth.requestDevice({
+          filters: [{ name: "BasureroInteligente" }],
+          optionalServices: [UUID_SERVICIO]
+        });
+
+        dispositivo.addEventListener("gattserverdisconnected", () => {
+          caracteristica = null;
+          mostrarEstado("Arduino desconectado.");
+        });
+
+        const servidor = await dispositivo.gatt.connect();
+        const servicio = await servidor.getPrimaryService(UUID_SERVICIO);
+        caracteristica = await servicio.getCharacteristic(UUID_CARACTERISTICA);
+
+        mostrarEstado("Arduino conectado.");
+      } catch (error) {
+        mostrarEstado("no se pudo conectar. Revisa el Arduino y Bluetooth.");
+        console.error(error);
+      }
+    }
+
+    function traducirCategoria(nombre) {
+      const n = nombre.normalize("NFD")
+        .replace(/[\u0300-\u036f]/g, "")
+        .toUpperCase().trim();
+
+      if (n === "CARTON_PAPEL") return "CARTON_PAPEL";
+      if (n === "RECICLABLES") return "RECICLABLES";
+      if (n === "ORGANICOS") return "ORGANICOS";
+      return null;
+    }
+
+    async function bucle() {
+      if (!camara || !modelo) return;
+
+      try {
+        camara.update();
+        const predicciones = await modelo.predict(camara.canvas);
+        predicciones.sort((a, b) => b.probability - a.probability);
+
+        const mejor = predicciones[0];
+        const categoria = traducirCategoria(mejor.className);
+        const porcentaje = (mejor.probability * 100).toFixed(1);
+
+        resultado.textContent =
+          "Clasificación: " + mejor.className + " (" + porcentaje + "%)";
+
+        const ahora = Date.now();
+
+        if (categoria && mejor.probability >= 0.85) {
+          if (categoria !== ultimaCategoria) {
+            ultimaCategoria = categoria;
+            inicioCategoria = ahora;
+          }
+
+          if (
+            ahora - inicioCategoria >= 1200 &&
+            ahora - ultimoEnvio >= 5000 &&
+            caracteristica &&
+            !clasificando
+          ) {
+            clasificando = true;
+            try {
+              const datos = new TextEncoder().encode(categoria);
+              await caracteristica.writeValue(datos);
+              ultimoEnvio = Date.now();
+              inicioCategoria = Date.now();
+              mostrarEstado("enviado: " + categoria + ". Esperando el sensor.");
+            } catch (error) {
+              mostrarEstado("error al enviar la categoría al Arduino.");
+              console.error(error);
+            } finally {
+              clasificando = false;
+            }
+          }
+        } else {
+          ultimaCategoria = "";
+          inicioCategoria = 0;
+        }
+      } catch (error) {
+        console.error("Error de clasificación:", error);
+      }
+
+      window.requestAnimationFrame(bucle);
+    }
+  </script>
+</body>
+</html>
